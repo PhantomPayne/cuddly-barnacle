@@ -291,6 +291,97 @@ generic(f: one)        // E = {Console}
 generic(f: two)        // E = {Console, FileSystem}
 ```
 
+### 2.9 Effects as Interfaces, Not DI Containers
+
+**Critical Design Guidance**: Effects should model **capabilities** (I/O, database, network, filesystem), not business logic abstractions.
+
+#### The Right Way: Effects for Capabilities
+
+```barnacle
+// ✅ Good: Effects represent I/O capabilities
+effect Database {
+    query(sql: String, params: List<Value>) -> List<Row>
+    execute(sql: String, params: List<Value>) -> Int
+}
+
+effect FileSystem {
+    read_file(path: String) -> String
+    write_file(path: String, content: String) -> ()
+}
+
+effect Network {
+    http_request(url: String, method: :get | :post) -> Response
+}
+
+// ✅ Good: Business logic is regular functions that USE effects
+export fn get_active_users() -> List<User> with Database {
+    let rows = Database.query(sql: "SELECT * FROM users WHERE active = true", params: [])
+    return rows |> map(transform: row => parse_user(row))
+}
+
+export fn save_user(user: User) -> () with Database, Fail<DbError> {
+    let result = Database.execute(
+        sql: "INSERT INTO users (name, email) VALUES (?, ?)", 
+        params: [user.name, user.email]
+    )
+    if result == 0 {
+        Fail.fail(error: DbError { message: "Insert failed" })
+    }
+}
+```
+
+#### The Wrong Way: Effects as Business Logic Wrappers
+
+```barnacle
+// ❌ Bad: Effect wraps business logic, not I/O
+effect UserService {
+    get_active_users() -> List<User>
+    create_user(name: String, email: String) -> User
+    delete_user(id: Int) -> ()
+    update_email(id: Int, email: String) -> ()
+    // ... 50 more operations
+}
+
+// This is just dependency injection with extra steps!
+// Write functions instead:
+```
+
+#### Why This Matters
+
+1. **Effects should be thin** — 3-10 operations, not 50+
+2. **Effects should be reusable** — `Database` effect works for many domains
+3. **Effects should map to I/O** — they represent actual side effects, not pure logic
+4. **Business logic should be functions** — composable, testable, no ceremony
+
+#### Named Effect Instances for Multiple Backends
+
+Use `as` to distinguish multiple instances of the same effect:
+
+```barnacle
+import effect Database from app/db as primary
+import effect Database from app/replica as replica
+
+export fn replicate_users() -> () with primary.Database, replica.Database {
+    let users = primary.Database.query(sql: "SELECT * FROM users", params: [])
+    for user in users {
+        replica.Database.execute(
+            sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+            params: [user.id, user.name, user.email]
+        )
+    }
+}
+```
+
+#### Lints and Guardrails
+
+The Barnacle linter warns on:
+- **Too many operations per effect** (> 20 operations): suggests splitting or using functions
+- **Too many custom effects** (> 5 in a module): suggests consolidating or using functions
+- **Effects without I/O operations**: suggests using regular functions instead
+- **Business domain names in effects**: suggests renaming to capability-based names
+
+The **path of least resistance** (writing functions) is the **correct path**. Effects are for when you need to abstract over implementation (testing, swapping backends, sandboxing).
+
 ---
 
 ## 3. The `world` Keyword — Configuration as Code
@@ -506,7 +597,7 @@ The common case — I/O, logging, configuration, most real-world effects. The ha
 
 ```barnacle
 handler io: FileSystem {
-    read_file(path) -> resume(wasi_read_file(path))
+    read_file(path) -> resume(wasi_read_file(path: path))
 }
 ```
 
@@ -526,7 +617,7 @@ Handlers that don't resume — used for exceptions and early exit:
 
 ```barnacle
 handler to_result: Fail<E> {
-    fail(error) -> Result.Err(error)  // no resume
+    fail(error) -> :err { error: error }
 }
 ```
 
@@ -553,8 +644,8 @@ Handlers that resume multiple times or store continuations — async, generators
 handler async_executor: Async {
     suspend() -> {
         let cont = capture_continuation()
-        scheduler.enqueue(cont)
-        // resume later when scheduled
+        scheduler.enqueue(item: cont)
+        return resume()
     }
 }
 ```
@@ -563,16 +654,15 @@ handler async_executor: Async {
 
 ```barnacle
 // Original
-fn work() with Async {
+export fn work() with Async {
     Async.suspend()
-    compute()
+    return compute()
 }
 
 // After CPS transform (conceptual)
-fn work$cps(k: Continuation) {
-    Async.suspend$cps(fn() {
-        compute()
-        k()
+export fn work$cps(k: Continuation) {
+    return Async.suspend$cps(handler: k => {
+        return compute()
     })
 }
 ```
@@ -637,9 +727,8 @@ The compiler exposes its internals (CST, HIR, types, symbols) as WIT interfaces.
 
 Lint functions take a **single item** (not the whole world) and return diagnostics as data. This makes them Salsa-cacheable:
 
-```barnacle
-// Per-item signature — Salsa caches per (lint, item) pair
-export check_function: func(id: func-id) -> list<diagnostic>
+```wit
+export check-function: func(id: func-id) -> list<diagnostic>
 ```
 
 When you edit one function, only that function's lint results are recomputed. This is crucial for IDE performance.
@@ -687,39 +776,47 @@ interface symbols {
 
 ```barnacle
 // lints/no_mut_pub_field.barnacle
-import compiler:syntax
-import compiler:types
-import compiler:symbols
+import compiler syntax from compiler:syntax
+import compiler types from compiler:types
+import compiler symbols from compiler:symbols
 
-export fn name() -> String { "no-mut-pub-field" }
+export fn name() -> String { 
+    return "no-mut-pub-field" 
+}
 
 export fn check_type(id: TypeId) -> List<Diagnostic> {
-    let def = types.type_definition(id)
-    match def {
-        TypeDef.Struct(s) -> {
-            s.fields
-                .filter(fn(f) { f.visibility == Pub && f.mutable })
-                .map(fn(f) {
-                    Diagnostic {
-                        level: Warning,
-                        span: syntax.get_span(f.id),
+    let def = types.type_definition(id: id)
+    return match def {
+        TypeDef.Struct(s: s) -> {
+            return s.fields
+                |> filter(predicate: f => f.visibility == :pub && f.mutable)
+                |> map(transform: f => {
+                    return Diagnostic {
+                        level: :warning,
+                        span: syntax.get_span(id: f.id),
                         message: "Public mutable fields break encapsulation",
                         code: "no-mut-pub-field",
                         fixes: [
                             TextEdit {
                                 span: f.vis_span,
-                                replacement: "",  // make private
+                                replacement: "",
                             }
                         ],
                     }
                 })
         }
-        _ -> []
+        _ -> {
+            return []
+        }
     }
 }
 
-export fn check_function(_: FuncId) -> List<Diagnostic> { [] }
-export fn check_module(_: ModuleId) -> List<Diagnostic> { [] }
+export fn check_function(_: FuncId) -> List<Diagnostic> { 
+    return [] 
+}
+export fn check_module(_: ModuleId) -> List<Diagnostic> { 
+    return [] 
+}
 ```
 
 The compiler runs this component for each type definition, caches the results, and shows diagnostics in the IDE.
@@ -738,9 +835,9 @@ annotation Deprecated {
 @Deprecated { 
     reason: "Use v2 API", 
     since: "0.3.0", 
-    replacement: Some("fetch_v2") 
+    replacement: :some { value: "fetch_v2" }
 }
-pub fn old_fetch() -> () with Http { ... }
+export fn old_fetch() -> () with Http { ... }
 
 annotation Doc {
     summary: String,
@@ -753,18 +850,20 @@ annotation Doc {
     examples: ["fetch(\"https://example.com\")"],
     see_also: ["fetch_v2", "Http.post"],
 }
-pub fn fetch(url: String) -> Response with Http { ... }
+export fn fetch(url: String) -> Response with Http { ... }
 ```
 
 Lint rules can query and pattern-match on annotations with full type safety:
 
 ```barnacle
-let deprecated_annot = annotations.get<Deprecated>(func_id)
-match deprecated_annot {
-    Some(d) -> {
-        // Generate deprecation warning with replacement suggestion
+let deprecated_annot = annotations.get<Deprecated>(id: func_id)
+return match deprecated_annot {
+    :some { value: d } -> {
+        return generate_deprecation_warning(d: d)
     }
-    None -> []
+    :none -> {
+        return []
+    }
 }
 ```
 
@@ -799,34 +898,41 @@ record text-edit {
 
 ```barnacle
 // actions/extract_effect.barnacle
-export fn title() -> String { "Extract to effect" }
+export fn title() -> String { 
+    return "Extract to effect" 
+}
 
 export fn applicable(ctx: ActionContext) -> Bool {
-    // Check if cursor is on a function with effects
     let node = ctx.node_at_cursor
-    match syntax.parent(node) {
-        Some(parent) if syntax.kind(parent) == FunctionDef -> {
-            let func = types.function(parent)
-            !func.effects.is_empty()
+    return match syntax.parent(id: node) {
+        :some { value: parent } -> {
+            if syntax.kind(id: parent) == FunctionDef {
+                let func = types.function(id: parent)
+                return !func.effects.is_empty()
+            } else {
+                return false
+            }
         }
-        _ -> false
+        :none -> {
+            return false
+        }
     }
 }
 
 export fn apply(ctx: ActionContext) -> List<TextEdit> {
-    // Generate an effect declaration from function effects
-    let func = types.function(ctx.node_at_cursor)
+    let func = types.function(id: ctx.node_at_cursor)
     let effect_name = func.name ++ "Effect"
     
-    let operations = func.effects.flat_map(fn(eff) {
-        types.effect_operations(eff)
-    })
+    let operations = func.effects
+        |> flat_map(fn: f => {
+            return types.effect_operations(id: f)
+        })
     
-    let effect_decl = generate_effect_decl(effect_name, operations)
+    let effect_decl = generate_effect_decl(name: effect_name, operations: operations)
     
-    [
+    return [
         TextEdit {
-            span: before_function(func),
+            span: before_function(func: func),
             replacement: effect_decl,
         }
     ]
@@ -958,9 +1064,8 @@ Marks compile-time execution:
 
 ```barnacle
 comptime {
-    // This runs at compile time
-    let routes = analyze_module(app:routes)
-    generate_client(routes, "./generated/client.ts")
+    let routes = analyze_module(app: app:routes)
+    generate_client(routes: routes, output_dir: "./generated/client.ts")
 }
 ```
 
@@ -986,7 +1091,9 @@ Write code templates in target languages with typed holes:
 ```barnacle
 let ts_code = ts`
     export interface ${type_name} {
-        ${fields.map(fn(f) { ts`${f.name}: ${ts_type(f.type)};` }).join("\n")}
+        ${fields.map(fn: f => { 
+            return ts`${f.name}: ${ts_type(type: f.type)};` 
+        }).join(separator: "\n")}
     }
 `
 ```
@@ -1003,17 +1110,15 @@ Similar quasiquotes for Python, JSON, OpenAPI, etc.
 Captures an expression as a typed AST node instead of evaluating it:
 
 ```barnacle
-fn analyze_query<T>(q: Quote<T>) -> QueryPlan {
-    // Can inspect the AST of q
-    match q {
-        Quote.BinaryOp(left, op, right) -> { ... }
-        Quote.Call(func, args) -> { ... }
+export fn analyze_query<T>(q: Quote<T>) -> QueryPlan {
+    return match q {
+        Quote.BinaryOp(left: left, op: op, right: right) -> { ... }
+        Quote.Call(func: func, args: args) -> { ... }
         _ -> { ... }
     }
 }
 
-let plan = analyze_query('user.filter(fn(u) { u.age > 18 }))
-// The expression is not evaluated, it's captured as an AST
+let plan = analyze_query(q: 'user.filter(predicate: u => u.age > 18))
 ```
 
 ### 7.2 Stdlib Generators (in standard library)
@@ -1024,49 +1129,55 @@ Specific generators are written using core primitives. They run as Wasm componen
 
 ```barnacle
 // std/codegen/typescript.barnacle
-pub fn generate_typescript_client(module: Module, output: String) with Reflect, FileSystem {
-    let funcs = Reflect.functions_in(module).filter(fn(f) { f.visibility == Pub })
+export fn generate_typescript_client(module: Module, output: String) with Reflect, FileSystem {
+    let funcs = Reflect.functions_in(module: module)
+        |> filter(predicate: f => f.visibility == :export)
     
-    let interfaces = funcs.map(fn(f) {
-        ts`
-        export async function ${f.name}(${params(f)}): Promise<${return_type(f)}> {
-            return fetch('/api/${f.name}', {
-                method: 'POST',
-                body: JSON.stringify(${arg_object(f)}),
-            }).then(r => r.json());
-        }
-        `
-    })
+    let interfaces = funcs
+        |> map(transform: f => {
+            return ts`
+            export async function ${f.name}(${params(func: f)}): Promise<${return_type(func: f)}> {
+                return fetch(path: '/api/${f.name}', options: {
+                    method: 'POST',
+                    body: JSON.stringify(${arg_object(func: f)}),
+                }).then(handler: r => r.json());
+            }
+            `
+        })
     
     let output_code = ts`
         // Auto-generated TypeScript client
-        ${interfaces.join("\n\n")}
+        ${interfaces.join(separator: "\n\n")}
     `
     
-    FileSystem.write_file(output, render(output_code))
+    return FileSystem.write_file(path: output, content: render(code: output_code))
 }
 ```
 
 #### OpenAPI Spec Generator
 
 ```barnacle
-pub fn generate_openapi(module: Module) with Reflect -> OpenApiSpec {
-    let routes = Reflect.functions_in(module)
-        .filter(fn(f) { has_annotation<Route>(f) })
+export fn generate_openapi(module: Module) with Reflect -> OpenApiSpec {
+    let routes = Reflect.functions_in(module: module)
+        |> filter(predicate: f => has_annotation<Route>(item: f))
     
-    OpenApiSpec {
+    return OpenApiSpec {
         openapi: "3.0.0",
         info: { title: "API", version: "1.0.0" },
-        paths: routes.map(fn(r) {
-            let route_annot = get_annotation<Route>(r)
-            (route_annot.path, {
-                route_annot.method: {
-                    parameters: r.params.map(openapi_param),
-                    responses: {
-                        "200": openapi_response(r.return_type),
-                    },
-                },
-            })
+        paths: routes.map(transform: r => {
+            let route_annot = get_annotation<Route>(item: r)
+            return {
+                path: route_annot.path,
+                endpoint: {
+                    method: route_annot.method,
+                    content: {
+                        parameters: r.params.map(transform: p => openapi_param(param: p)),
+                        responses: {
+                            "200": openapi_response(type: r.return_type),
+                        },
+                    }
+                }
+            }
         }).into_map(),
     }
 }
@@ -1098,11 +1209,11 @@ When you run `barnacle build --world api`, the generators run and produce files.
 |---|---|
 | `comptime`, `Reflect`, quasiquote syntax, `Quote` type | TypeScript/Python/OpenAPI generators |
 | Pipeline operator `\|>` | Data libraries (DataSet, filter, group_by) |
-| Row types `{ name: String, age: I32 }` | SQL backends, Arrow engines |
+| Row types `{ name: String, age: Int }` | SQL backends, Arrow engines |
 | Expression capture `'expr` | Lineage tracking, DAG visualization |
 | `Never` type, `Fail` effect | `Result` type, error handling utilities |
 | Effect system, handlers | Specific effects (Http, Database, Logger) |
-| Core types (I32, String, List, Option) | Collections, algorithms, utilities |
+| Core types (Int, String, List, Option) | Collections, algorithms, utilities |
 
 The core is minimal and orthogonal. Everything else is built on top in userland.
 
@@ -1183,13 +1294,13 @@ Set<T>
 type Point { x: Float, y: Float }
 
 // Anonymous row type (inline)
-fn get_name(obj: { name: String }) -> String {
-    obj.name
+export fn get_name(obj: { name: String }) -> String {
+    return obj.name
 }
 
 // Works with any value that has a `name: String` field
-get_name({ name: "Alice", age: 30 })
-get_name({ name: "Bob", city: "NYC", active: true })
+get_name(obj: { name: "Alice", age: 30 })
+get_name(obj: { name: "Bob", city: "NYC", active: true })
 ```
 
 Named types via `type Name { fields }` are **named aliases for shapes**, not distinct nominal types. This makes APIs flexible while maintaining readability.
@@ -1202,12 +1313,12 @@ Barnacle supports **width subtyping** — a type with more fields can be used wh
 type Person { name: String }
 type Employee { name: String, id: Int, department: String }
 
-fn greet(person: Person) -> String {
-    "Hello, {person.name}!"
+export fn greet(person: Person) -> String {
+    return "Hello, {person.name}!"
 }
 
 let emp: Employee = { name: "Alice", id: 42, department: "Engineering" }
-greet(emp)  // ✅ Employee has all fields of Person (and more)
+greet(person: emp)
 ```
 
 The extra fields are ignored at the call site. This enables evolution of data structures without breaking existing code.
@@ -1217,9 +1328,11 @@ The extra fields are ignored at the call site. This enables evolution of data st
 Full support for parametric polymorphism:
 
 ```barnacle
-fn identity<T>(value: T) -> T { value }
+export fn identity<T>(value: T) -> T { 
+    return value 
+}
 
-fn map<T, U, E>(self list: List<T>, transform: (T) -> U with E) -> List<U> with E {
+export fn map<T, U, E>(self list: List<T>, transform: (T) -> U with E) -> List<U> with E {
     // Generic over value types T, U and effect set E
 }
 
@@ -1236,9 +1349,8 @@ enum Tree<T> {
 Functions can be generic over effect sets:
 
 ```barnacle
-fn retry<T, E>(f: () -> T with E, times: Int) -> T with E {
-    // Generic over effect set E
-    // Works with any effect, including Fail
+export fn retry<T, E>(f: () -> T with E, times: Int) -> T with E {
+    return f()
 }
 ```
 
@@ -1268,19 +1380,19 @@ Tags are:
 Use `tag()` to add evidence (accumulates with existing tags):
 
 ```barnacle
-fn validate_email(input: String) -> String & :email with Fail<ValidationError> {
-    if input.contains("@") {
+export fn validate_email(input: String) -> String & :email with Fail<ValidationError> {
+    if input.contains(needle: "@") {
         return tag(value: input, as: :email)
     } else {
-        Fail.fail(ValidationError { message: "Invalid email" })
+        return Fail.fail(error: ValidationError { message: "Invalid email" })
     }
 }
 
-fn ensure_positive(value: Int) -> Int & :positive with Fail<ValueError> {
+export fn ensure_positive(value: Int) -> Int & :positive with Fail<ValueError> {
     if value > 0 {
         return tag(value: value, as: :positive)
     } else {
-        Fail.fail(ValueError { message: "Value must be positive" })
+        return Fail.fail(error: ValueError { message: "Value must be positive" })
     }
 }
 ```
@@ -1288,9 +1400,9 @@ fn ensure_positive(value: Int) -> Int & :positive with Fail<ValueError> {
 Use `retag()` to replace all tags (for state transitions):
 
 ```barnacle
-fn disconnect(conn: Connection & :connected) -> Connection & :disconnected {
-    close_socket(conn)
-    retag(value: conn, as: :disconnected)
+export fn disconnect(conn: Connection & :connected) -> Connection & :disconnected {
+    close_socket(socket: conn)
+    return retag(value: conn, as: :disconnected)
 }
 ```
 
@@ -1305,12 +1417,12 @@ type User {
     age: Int & :positive,
 }
 
-fn create_user(email: String, username: String, age: Int) -> User with Fail<ValidationError> {
-    let valid_email = validate_email(email)
-    let valid_username = validate_non_empty(username)
-    let valid_age = ensure_positive(age)
+export fn create_user(email: String, username: String, age: Int) -> User with Fail<ValidationError> {
+    let valid_email = validate_email(input: email)
+    let valid_username = validate_non_empty(input: username)
+    let valid_age = ensure_positive(value: age)
     
-    { email: valid_email, username: valid_username, age: valid_age }
+    return { email: valid_email, username: valid_username, age: valid_age }
 }
 ```
 
@@ -1319,15 +1431,15 @@ fn create_user(email: String, username: String, age: Int) -> User with Fail<Vali
 ```barnacle
 type Connection { socket: Socket }
 
-fn connect(host: String) -> Connection & :connected with Network { ... }
-fn authenticate(conn: Connection & :connected) -> Connection & :connected & :authenticated with Network { ... }
-fn send_message(conn: Connection & :connected & :authenticated, msg: String) -> () with Network { ... }
+export fn connect(host: String) -> Connection & :connected with Network { ... }
+export fn authenticate(conn: Connection & :connected) -> Connection & :connected & :authenticated with Network { ... }
+export fn send_message(conn: Connection & :connected & :authenticated, msg: String) -> () with Network { ... }
 
 // Type system prevents you from sending messages without authentication:
 let conn = connect(host: "example.com")
-// send_message(conn, "hello")  // ❌ Type error: missing :authenticated tag
-let authed = authenticate(conn)
-send_message(conn: authed, msg: "hello")  // ✅
+// send_message(conn: conn, msg: "hello")
+let authed = authenticate(conn: conn)
+send_message(conn: authed, msg: "hello")
 ```
 
 **3. Capabilities / Permissions**
@@ -1335,12 +1447,11 @@ send_message(conn: authed, msg: "hello")  // ✅
 ```barnacle
 type Request { path: String, headers: Map<String, String> }
 
-fn require_auth(req: Request) -> Request & :authenticated with Fail<AuthError> { ... }
-fn require_admin(req: Request & :authenticated) -> Request & :authenticated & :admin with Fail<AuthError> { ... }
+export fn require_auth(req: Request) -> Request & :authenticated with Fail<AuthError> { ... }
+export fn require_admin(req: Request & :authenticated) -> Request & :authenticated & :admin with Fail<AuthError> { ... }
 
-fn delete_user(req: Request & :authenticated & :admin, user_id: Int) -> () with Database {
-    // Can only be called with authenticated + admin request
-    Database.execute(query: "DELETE FROM users WHERE id = ?", params: [user_id])
+export fn delete_user(req: Request & :authenticated & :admin, user_id: Int) -> () with Database {
+    return Database.execute(query: "DELETE FROM users WHERE id = ?", params: [user_id])
 }
 ```
 
@@ -1349,10 +1460,10 @@ fn delete_user(req: Request & :authenticated & :admin, user_id: Int) -> () with 
 ```barnacle
 type File { handle: FileHandle }
 
-fn open_file(path: String) -> File & :open with FileSystem { ... }
-fn make_writable(file: File & :open) -> File & :open & :writable with FileSystem { ... }
-fn write(file: File & :open & :writable, data: String) -> () with FileSystem { ... }
-fn close(file: File & :open) -> File & :closed with FileSystem { ... }
+export fn open_file(path: String) -> File & :open with FileSystem { ... }
+export fn make_writable(file: File & :open) -> File & :open & :writable with FileSystem { ... }
+export fn write(file: File & :open & :writable, data: String) -> () with FileSystem { ... }
+export fn close(file: File & :open) -> File & :closed with FileSystem { ... }
 ```
 
 **5. Data Provenance / Pipeline Stages**
@@ -1360,12 +1471,12 @@ fn close(file: File & :open) -> File & :closed with FileSystem { ... }
 ```barnacle
 type Dataset<T> { rows: List<T> }
 
-fn clean(data: Dataset<T>) -> Dataset<T> & :cleaned { ... }
-fn dedupe(data: Dataset<T> & :cleaned) -> Dataset<T> & :cleaned & :deduped { ... }
-fn normalize(data: Dataset<T> & :cleaned & :deduped) -> Dataset<T> & :cleaned & :deduped & :normalized { ... }
+export fn clean(data: Dataset<T>) -> Dataset<T> & :cleaned { ... }
+export fn dedupe(data: Dataset<T> & :cleaned) -> Dataset<T> & :cleaned & :deduped { ... }
+export fn normalize(data: Dataset<T> & :cleaned & :deduped) -> Dataset<T> & :cleaned & :deduped & :normalized { ... }
 
-fn analyze(data: Dataset<User> & :cleaned & :deduped & :normalized) -> Report {
-    // Type system ensures data has gone through all required stages
+export fn analyze(data: Dataset<User> & :cleaned & :deduped & :normalized) -> Report {
+    return process_data(data: data)
 }
 ```
 
@@ -1376,20 +1487,20 @@ Instead of traditional builder patterns, use tags to track required fields:
 ```barnacle
 type HttpRequest { url: Option<String>, method: Option<String>, headers: Map<String, String> }
 
-fn new_request() -> HttpRequest {
-    { url: :none, method: :none, headers: {} }
+export fn new_request() -> HttpRequest {
+    return { url: :none, method: :none, headers: {} }
 }
 
-fn with_url(req: HttpRequest, url: String) -> HttpRequest & :has_url {
-    tag(value: { ...req, url: :some { value: url } }, as: :has_url)
+export fn with_url(req: HttpRequest, url: String) -> HttpRequest & :has_url {
+    return tag(value: { ...req, url: :some { value: url } }, as: :has_url)
 }
 
-fn with_method(req: HttpRequest, method: String) -> HttpRequest & :has_method {
-    tag(value: { ...req, method: :some { value: method } }, as: :has_method)
+export fn with_method(req: HttpRequest, method: String) -> HttpRequest & :has_method {
+    return tag(value: { ...req, method: :some { value: method } }, as: :has_method)
 }
 
-fn send(req: HttpRequest & :has_url & :has_method) -> Response with Network {
-    // Type system ensures URL and method are set before sending
+export fn send(req: HttpRequest & :has_url & :has_method) -> Response with Network {
+    return make_request(req: req)
 }
 ```
 
@@ -1397,28 +1508,26 @@ fn send(req: HttpRequest & :has_url & :has_method) -> Response with Network {
 
 ```barnacle
 // SMTP protocol states
-fn smtp_connect() -> SmtpSession & :connected { ... }
-fn smtp_helo(session: SmtpSession & :connected) -> SmtpSession & :greeted { ... }
-fn smtp_mail_from(session: SmtpSession & :greeted) -> SmtpSession & :has_sender { ... }
-fn smtp_rcpt_to(session: SmtpSession & :has_sender) -> SmtpSession & :has_recipient { ... }
-fn smtp_data(session: SmtpSession & :has_recipient) -> SmtpSession & :sending_data { ... }
+export fn smtp_connect() -> SmtpSession & :connected { ... }
+export fn smtp_helo(session: SmtpSession & :connected) -> SmtpSession & :greeted { ... }
+export fn smtp_mail_from(session: SmtpSession & :greeted) -> SmtpSession & :has_sender { ... }
+export fn smtp_rcpt_to(session: SmtpSession & :has_sender) -> SmtpSession & :has_recipient { ... }
+export fn smtp_data(session: SmtpSession & :has_recipient) -> SmtpSession & :sending_data { ... }
 ```
 
 **8. Taint Tracking**
 
 ```barnacle
 // User input is tainted by default
-fn get_user_input() -> String & :tainted with Console { ... }
+export fn get_user_input() -> String & :tainted with Console { ... }
 
-fn sanitize_html(input: String & :tainted) -> String & :sanitized {
-    // Remove dangerous HTML
-    let clean = strip_tags(input)
-    tag(value: clean, as: :sanitized)
+export fn sanitize_html(input: String & :tainted) -> String & :sanitized {
+    let clean = strip_tags(html: input)
+    return tag(value: clean, as: :sanitized)
 }
 
-fn render_html(content: String & :sanitized) -> String {
-    // Only accepts sanitized content
-    "<div>{content}</div>"
+export fn render_html(content: String & :sanitized) -> String {
+    return "<div>{content}</div>"
 }
 ```
 
@@ -1429,10 +1538,9 @@ fn render_html(content: String & :sanitized) -> String {
 - **Together**: If code is reachable after a validation function with `Fail`, the tag is guaranteed
 
 ```barnacle
-fn process_email(input: String) -> () with Fail<ValidationError> {
-    let email = validate_email(input)  // Returns String & :email, but can Fail
-    // If we reach this line, email definitely has :email tag
-    send_email(to: email)
+export fn process_email(input: String) -> () with Fail<ValidationError> {
+    let email = validate_email(input: input)
+    return send_email(to: email)
 }
 ```
 
@@ -1442,7 +1550,7 @@ Tags can always be stripped through widening:
 
 ```barnacle
 let tagged: Int & :positive = ensure_positive(value: 42)
-let plain: Int = tagged  // ✅ Widening is always safe
+let plain: Int = tagged
 ```
 
 This allows tagged values to be used in contexts that don't care about the evidence.
@@ -1471,15 +1579,21 @@ Use `|` to create anonymous unions of atoms:
 
 ```barnacle
 // Function that returns one of several atoms
-fn status() -> :ok | :pending | :error {
-    :ok
+export fn status() -> :ok | :pending | :error {
+    return :ok
 }
 
 // Pattern match on atom unions
-match status() {
-    :ok -> "Success"
-    :pending -> "In progress"
-    :error -> "Failed"
+return match status() {
+    :ok -> {
+        return "Success"
+    }
+    :pending -> {
+        return "In progress"
+    }
+    :error -> {
+        return "Failed"
+    }
 }
 ```
 
@@ -1518,12 +1632,12 @@ enum Color {
     :blue,
 }
 
-fn is_primary(color: :red | :blue) -> Bool {
-    true
+export fn is_primary(color: :red | :blue) -> Bool {
+    return true
 }
 
 let c: Color = :red
-is_primary(c)  // ✅ :red in Color is compatible with :red in union
+is_primary(color: c)
 ```
 
 #### Syntax Semantics
@@ -1581,11 +1695,11 @@ enum Option<T> {
     :none,
 }
 
-fn divide(a: Int, b: Int) -> Option<Int> {
+export fn divide(a: Int, b: Int) -> Option<Int> {
     if b == 0 {
-        :none
+        return :none
     } else {
-        :some { value: a / b }
+        return :some { value: a / b }
     }
 }
 ```
@@ -1599,8 +1713,8 @@ Barnacle has **no methods attached to types**. Instead:
 
 ```barnacle
 // Define functions with self parameter (positional for pipeline)
-fn filter<T>(self data: List<T>, predicate: (T) -> Bool) -> List<T> { ... }
-fn map<T, U>(self data: List<T>, transform: (T) -> U) -> List<U> { ... }
+export fn filter<T>(self data: List<T>, predicate: (T) -> Bool) -> List<T> { ... }
+export fn map<T, U>(self data: List<T>, transform: (T) -> U) -> List<U> { ... }
 
 // Use pipeline operator for "method call" syntax
 users 
@@ -1609,7 +1723,7 @@ users
     |> sort()
 
 // Equivalent to:
-sort(map(transform: u => u.name, self: filter(predicate: u => u.active, self: users)))
+sort(data: map(transform: u => u.name, self: filter(predicate: u => u.active, self: users)))
 ```
 
 The `self` parameter is special:
@@ -1624,13 +1738,13 @@ Types are pure data. Modules organize related functions.
 Records are structural (duck-typed):
 
 ```barnacle
-fn get_name(obj: { name: String }) -> String {
-    obj.name
+export fn get_name(obj: { name: String }) -> String {
+    return obj.name
 }
 
 // Works with any record that has a `name: String` field
-get_name({ name: "Alice", age: 30 })
-get_name({ name: "Bob", city: "NYC" })
+get_name(obj: { name: "Alice", age: 30 })
+get_name(obj: { name: "Bob", city: "NYC" })
 ```
 
 This enables row polymorphism for flexible APIs.
@@ -1641,11 +1755,11 @@ Barnacle does not have tuples. Use row types with named fields instead:
 
 ```barnacle
 // ❌ No tuples
-// fn divide(a: Int, b: Int) -> (Int, Int)
+// export fn divide(a: Int, b: Int) -> (Int, Int)
 
 // ✅ Use row types
-fn divide(a: Int, b: Int) -> { quotient: Int, remainder: Int } {
-    { quotient: a / b, remainder: a % b }
+export fn divide(a: Int, b: Int) -> { quotient: Int, remainder: Int } {
+    return { quotient: a / b, remainder: a % b }
 }
 
 let result = divide(a: 17, b: 5)
@@ -1673,16 +1787,16 @@ Barnacle has a simplified ownership model:
 
 ```barnacle
 // Move semantics by default
-let x = Box.new(42)
-let y = x    // x is moved to y, x is no longer usable
+let x = Box.new(value: 42)
+let y = x
 
 // Explicit borrow with &
-fn print_length(s: &String) {
-    Console.print(s.length.to_string())
+export fn print_length(s: &String) {
+    Console.print(s: s.length.to_string())
 }
 
 let s = "hello"
-print_length(&s)  // s is borrowed, still usable after
+print_length(s: &s)
 ```
 
 No lifetimes or borrow checker. The compiler inserts reference count operations automatically, with optimizations to elide unnecessary ones.
@@ -1693,7 +1807,7 @@ No lifetimes or borrow checker. The compiler inserts reference count operations 
 
 ```barnacle
 let x = expensive_computation()
-let y = transform(x)  // x's last use — no ref count increment needed
+let y = transform(x: x)
 return y
 ```
 
@@ -1703,14 +1817,14 @@ The compiler tracks last uses and skips reference count operations when possible
 
 ```barnacle
 let s = "hello"
-let s2 = s.append(" world")  // If s is unique, mutate in place; otherwise, copy
+let s2 = s.append(suffix: " world")
 ```
 
 #### Reuse Analysis
 
 ```barnacle
 let list = [1, 2, 3]
-let list2 = list.map(fn(x) { x * 2 })  // Reuse list's allocation for list2
+let list2 = list.map(transform: x => x * 2)
 ```
 
 When a collection is consumed and a new one is produced, reuse the allocation if the ref count is 1.
@@ -1751,14 +1865,13 @@ export type User {
 }
 
 export fn create_user(name: String, email: String) -> User with Database {
-    let user = { name: capitalize(name), email }
+    let user = { name: capitalize(s: name), email: email }
     Database.insert(table: "users", data: user)
     return user
 }
 
-fn validate_email(email: String) -> Bool {
-    // private helper
-    email.contains("@")
+export fn validate_email(email: String) -> Bool {
+    return email.contains(needle: "@")
 }
 ```
 
@@ -1818,9 +1931,9 @@ The `as` keyword enables multiple instances of the same effect:
 import effect Database from app/db as primary
 import effect Database from app/replica as secondary
 
-fn replicate_data() -> () with primary.Database, secondary.Database {
+export fn replicate_data() -> () with primary.Database, secondary.Database {
     let data = primary.Database.query(sql: "SELECT * FROM users")
-    secondary.Database.insert_batch(data: data)
+    return secondary.Database.insert_batch(data: data)
 }
 ```
 
@@ -1861,7 +1974,7 @@ import effect Console from std/io
 export fn main() -> () with Database, Console {
     Console.print(msg: "Starting app...")
     let users = Database.query(sql: "SELECT * FROM users")
-    Console.print(msg: "Found {users.length} users")
+    return Console.print(msg: "Found {users.length} users")
 }
 
 // world configuration (separate file or section)
@@ -1877,9 +1990,9 @@ Local `handle` blocks can still use handlers directly:
 ```barnacle
 import handler mock_db from app/test_helpers
 
-fn test_create_user() {
+export fn test_create_user() {
     let result = handle create_user(name: "Alice", email: "alice@example.com") with mock_db
-    assert(result.name == "Alice")
+    return assert(condition: result.name == "Alice")
 }
 ```
 
@@ -1981,22 +2094,22 @@ const PI: Float = 3.14159
 
 ```barnacle
 // Function declaration
-fn add(a: Int, b: Int) -> Int {
+export fn add(a: Int, b: Int) -> Int {
     return a + b
 }
 
 // Function with default values
-fn connect(host: String, port: Int = 5432) -> Connection {
-    // port is optional, defaults to 5432
+export fn connect(host: String, port: Int = 5432) -> Connection {
+    return create_connection(host: host, port: port)
 }
 
 // Call with named arguments
 connect(host: "localhost", port: 5432)
-connect(host: "localhost")  // uses default port
+connect(host: "localhost")
 
 // Function with self parameter (for pipeline)
-fn filter<T>(self data: List<T>, predicate: (T) -> Bool) -> List<T> {
-    // self is positional and feeds from pipeline
+export fn filter<T>(self data: List<T>, predicate: (T) -> Bool) -> List<T> {
+    return data.filter(predicate: predicate)
 }
 
 // Pipeline usage
@@ -2004,7 +2117,7 @@ users |> filter(predicate: u => u.active)
 // Equivalent to: filter(self: users, predicate: u => u.active)
 
 // Explicit return required
-fn max(a: Int, b: Int) -> Int {
+export fn max(a: Int, b: Int) -> Int {
     if a > b {
         return a
     } else {
@@ -2298,13 +2411,13 @@ effect Console {
 }
 
 // Function with effects
-fn greet(name: String) -> () with Console {
-    Console.print(msg: "Hello, {name}!")
+export fn greet(name: String) -> () with Console {
+    return Console.print(msg: "Hello, {name}!")
 }
 
 // Handler
 handler real_console: Console {
-    print(msg) -> resume(wasi_print(msg))
+    print(msg: msg) -> resume(wasi_print(msg: msg))
     read_line() -> resume(wasi_read_line())
 }
 
@@ -2319,24 +2432,23 @@ The `use` keyword provides sugar over effect handlers for resource cleanup:
 ```barnacle
 // use binding runs cleanup when block exits
 use file = open_file(path: "config.toml")
-let contents = read_file(file)
+let contents = read_file(file: file)
 // file automatically closed here
 
 // Multiple use bindings dispose in reverse order
 use conn = connect(host: "localhost")
-use tx = begin_transaction(conn)
-let result = execute_query(tx)
-commit(tx)
+use tx = begin_transaction(conn: conn)
+let result = execute_query(tx: tx)
+commit(transaction: tx)
 // tx disposed, then conn disposed
 
 // Cleanup runs even on Fail
-fn process_file(path: String) -> String with FileSystem, Fail<IoError> {
-    use file = open_file(path)  // Acquires resource
-    if !is_valid(file) {
-        Fail.fail(IoError { message: "Invalid file" })
-        // file still cleaned up!
+export fn process_file(path: String) -> String with FileSystem, Fail<IoError> {
+    use file = open_file(path: path)
+    if !is_valid(file: file) {
+        return Fail.fail(error: IoError { message: "Invalid file" })
     }
-    return read_file(file)
+    return read_file(file: file)
 }
 ```
 
@@ -2511,15 +2623,15 @@ Tests are just functions marked with `@Test`:
 
 ```barnacle
 @Test
-fn test_addition() {
-    assert_eq(1 + 1, 2)
+export fn test_addition() {
+    return assert_eq(a: 1 + 1, b: 2)
 }
 
 @Test
-fn test_with_effects() with Console {
-    handle {
-        Console.print("test")
-        assert_eq(1 + 1, 2)
+export fn test_with_effects() with Console {
+    return handle {
+        Console.print(msg: "test")
+        return assert_eq(a: 1 + 1, b: 2)
     } with mock_console
 }
 ```
@@ -2539,10 +2651,12 @@ Documentation is written in annotations:
 ```barnacle
 @Doc {
     summary: "Adds two numbers",
-    examples: ["add(1, 2) // returns 3"],
+    examples: ["add(a: 1, b: 2)"],
     see_also: ["subtract", "multiply"],
 }
-pub fn add(a: I32, b: I32) -> I32 { a + b }
+export fn add(a: Int, b: Int) -> Int { 
+    return a + b 
+}
 ```
 
 Documentation is extracted at compile time and rendered as HTML, Markdown, or JSON.
@@ -2551,9 +2665,136 @@ Documentation is extracted at compile time and rendered as HTML, Markdown, or JS
 
 ## 14. Open Questions & Future Work
 
-### 14.1 Wasm Stack Switching
+### 14.1 Memory Management Strategy
 
-**Question**: When should we migrate from CPS transform to stack switching for Tier 3 effects?
+**Question**: Should Barnacle use reference counting, tracing GC, or Wasm GC?
+
+**Considerations**:
+- Reference counting: Predictable performance, but can leak cycles
+- Tracing GC: Handles cycles, but requires runtime support
+- Wasm GC: Native support in Wasm, but still evolving
+
+**Current plan**: Perceus-style reference counting with optimizations. Consider Wasm GC as a future backend target.
+
+### 14.2 Trait/Protocol System for Generic Constraints
+
+**Question**: How should trait constraints work with generics?
+
+**Current design**:
+```barnacle
+fn sort<T>(self list: List<T>) -> List<T> where T: Ord
+```
+
+**Open questions**:
+- Syntax for trait bounds (`where T: Trait` vs `T: Trait` in signature)
+- Associated types
+- Higher-kinded types
+- Trait coherence and orphan rules
+
+**Plan**: Design in progress. Inspired by Rust traits + Haskell type classes.
+
+### 14.3 Operator Overloading
+
+**Question**: Should custom types support operator overloading?
+
+**Use cases**:
+- Mathematical types (complex numbers, vectors, matrices)
+- DSLs (query builders, numeric code)
+
+**Considerations**:
+- Trait-based approach (e.g., `Add`, `Mul` traits)
+- Risk of abuse (unclear code)
+- Integration with numeric types
+
+**Plan**: Likely yes, via traits. Details TBD.
+
+### 14.4 Fail<E> — Stdlib vs Compiler-Known
+
+**Question**: Should `Fail<E>` be a regular stdlib effect or compiler-known special case?
+
+**Considerations**:
+- Compiler-known: Can provide better error messages and optimizations
+- Stdlib: Keeps compiler simpler, more principled
+
+**Current plan**: Start as stdlib effect, add compiler hints if needed.
+
+### 14.5 Self-Hosting Roadmap
+
+**Question**: When should Barnacle be self-hosted (compiler written in Barnacle)?
+
+**Milestones**:
+1. Bootstrap compiler in Rust (✅ in progress)
+2. Core language features stabilize (target: Q2 2026)
+3. Begin self-hosted compiler development (target: Q3 2026)
+4. Switch to self-hosted by default (target: Q4 2026)
+
+**Benefits**: Dogfooding, better compiler errors, metaprogramming in Barnacle itself.
+
+### 14.6 Package Registry
+
+**Question**: How should the package ecosystem work?
+
+**Options**:
+1. Central registry (like crates.io, npm)
+2. Decentralized (git URLs, IPFS)
+3. Hybrid approach
+
+**Current thinking**:
+- Wasm component registries (warg, etc.)
+- Integration with existing Wasm ecosystem
+- Support for private registries
+
+**Plan**: Follow WebAssembly Package Registry (warg) standards as they mature.
+
+### 14.7 Field Visibility for Exported Types
+
+**Question**: Should exported types have fine-grained field visibility?
+
+**Current design**: Leaning towards **all fields visible** when type is exported.
+
+```barnacle
+// Option A: All fields visible (simpler)
+export type User {
+    name: String,
+    email: String,
+    password_hash: String,  // visible if User is exported
+}
+
+// Option B: Per-field visibility (more complex, may add later)
+export type User {
+    export name: String,
+    export email: String,
+    password_hash: String,  // private even if User is exported
+}
+```
+
+**Tradeoffs**:
+- All visible: Simple, encourages small focused types, structural typing friendly
+- Per-field: More control, but adds complexity
+
+**Plan**: Start with all-visible. Add per-field visibility if strong use cases emerge.
+
+### 14.8 Generic Constraint Syntax
+
+**Question**: What syntax for trait/protocol constraints on generics?
+
+**Options**:
+```barnacle
+// Option 1: Where clause (Rust-style)
+fn sort<T>(self list: List<T>) -> List<T> where T: Ord
+
+// Option 2: Inline (Swift/Kotlin-style)
+fn sort<T: Ord>(self list: List<T>) -> List<T>
+
+// Option 3: Effect-like (experimental)
+fn sort<T>(self list: List<T>) -> List<T> with T: Ord
+```
+
+**Plan**: Explore ergonomics in practice. Likely where clause for consistency with effect syntax.
+
+### 14.9 Wasm Stack Switching
+
+**Question**: When should we migrate from CPS transform to stack switching for multi-shot effects?
 
 **Considerations**:
 - Stack switching proposal is not yet standardized
@@ -2562,34 +2803,7 @@ Documentation is extracted at compile time and rendered as HTML, Markdown, or JS
 
 **Plan**: Support both strategies, with a compiler flag to choose. Migrate ecosystem gradually.
 
-### 14.2 Dependent Types
-
-**Question**: Should Barnacle support dependent types?
-
-**Use cases**:
-- Length-indexed lists
-- Refined types (positive integers, non-empty strings)
-- Type-safe DSLs
-
-**Concerns**:
-- Complexity for compiler and users
-- Type inference becomes undecidable
-- May not fit with Wasm's runtime model
-
-**Plan**: Explore in a research branch. Not for 1.0.
-
-### 14.3 Linear Types
-
-**Question**: Should we add linear types for resource management?
-
-**Use cases**:
-- File handles that must be closed
-- Network connections
-- Tokens representing unique capabilities
-
-**Plan**: Effect system already provides resource safety for many cases (handlers ensure cleanup). Linear types are a possible future addition if the need arises.
-
-### 14.4 Concurrency Model
+### 14.10 Concurrency Model
 
 **Question**: What concurrency primitives should be built-in vs library?
 
@@ -2599,38 +2813,6 @@ Documentation is extracted at compile time and rendered as HTML, Markdown, or JS
 - Structured concurrency via handlers
 
 **Open**: Parallel computation (not just concurrent), work-stealing, data parallelism.
-
-### 14.5 Module Versioning
-
-**Question**: How do we handle breaking changes in Wasm component interfaces?
-
-**Options**:
-1. Semantic versioning + major version in package name
-2. Interface versioning in WIT
-3. Adapter components for compatibility
-
-**Plan**: Follow Wasm component model conventions as they evolve.
-
-### 14.6 Interactive Development
-
-**Question**: Should we support hot code reloading?
-
-**Use cases**:
-- Web development
-- Game development
-- Interactive applications
-
-**Plan**: Effects make this feasible (no global state). Explore in tooling.
-
-### 14.7 Metaprogramming Boundaries
-
-**Question**: What's the right balance between compile-time and runtime metaprogramming?
-
-**Current design**:
-- Compile-time: `comptime`, `Reflect`, code generation
-- Runtime: Traits, effect handlers
-
-**Open**: Procedural macros, type-level computation, plugin systems.
 
 ---
 
