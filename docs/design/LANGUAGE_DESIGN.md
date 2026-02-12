@@ -93,13 +93,13 @@ Functions that perform effects gain those effects in their signature. Effects ar
 
 ```barnacle
 // Public — effects must be declared (this is your API contract)
-pub fn greet(name: String) -> () with Console {
-    Console.print("Hello, " ++ name ++ "!")
+export fn greet(name: String) -> () with Console {
+    Console.print(msg: "Hello, {name}!")
 }
 
 // Private — effects inferred by the compiler
 fn helper() {
-    Console.print("internal")
+    Console.print(msg: "internal")
 }
 // compiler infers: with Console
 ```
@@ -152,7 +152,7 @@ fn c() with Console, Async {
 Higher-order functions are **effect-polymorphic** — they're generic over the effect set:
 
 ```barnacle
-fn map<T, U, E>(list: List<T>, f: (T) -> U with E) -> List<U> with E {
+fn map<T, U, E>(self list: List<T>, transform: (T) -> U with E) -> List<U> with E {
     // works with pure functions, effectful functions, async functions — all the same
 }
 ```
@@ -173,20 +173,19 @@ This replaces `try`/`catch`, `Result<T,E>`, `throws`, and the `?` operator — a
 
 ```barnacle
 // Creating an error — just perform the effect
-fn parse_int(s: String) -> I32 {
+fn parse_int(s: String) -> Int with Fail<ParseError> {
     match try_parse(s) {
-        Some(n) -> n
-        None -> Fail.fail(ParseError { input: s })
+        :some { value } -> return value
+        :none -> Fail.fail(error: ParseError { input: s })
     }
 }
-// compiler infers: with Fail<ParseError>
 
 // Handling — wrap in handle at any point
 let result = handle parse_int("abc") with to_result
-// result: Result<I32, ParseError>
+// result: Result<Int, ParseError>
 
 let value = handle parse_int("abc") with or_default(0)
-// value: I32 (always succeeds)
+// value: Int (always succeeds)
 ```
 
 Effect inference means you DON'T need to annotate every function in the call chain with `Fail<E>` — only public boundaries and the origin. This avoids the Java checked exceptions problem. Internal functions infer their full effect set.
@@ -200,7 +199,7 @@ The standard library provides common handlers:
 ```barnacle
 // Convert to Result type
 handler to_result<T, E>: Fail<E> -> Result<T, E> {
-    fail(error) -> Result.Err(error)
+    fail(error) -> :err { error }
 }
 
 // Provide a default value
@@ -212,13 +211,13 @@ fn or_default<T, E>(default: T): Handler<Fail<E>, T> {
 
 // Panic on error
 handler to_panic<E>: Fail<E> {
-    fail(error) -> panic(format("Unhandled error: {}", error))
+    fail(error) -> panic(message: "Unhandled error: {error}")
 }
 
 // Transform error type
 fn map_error<E1, E2>(f: (E1) -> E2): Handler<Fail<E1>, Fail<E2>> {
     handler {
-        fail(error) -> Fail.fail(f(error))
+        fail(error) -> Fail.fail(error: f(error))
     }
 }
 ```
@@ -250,14 +249,15 @@ Modules can export both pure functions and effect declarations. Pure functions a
 ```barnacle
 // std/fs.barnacle
 effect FileSystem { ... }              // effect
-pub fn join_path(a: String, b: String) -> String { ... }  // pure function
-pub fn extension(path: String) -> Option<String> { ... }  // pure function
+export fn join_path(a: String, b: String) -> String { ... }  // pure function
+export fn extension(path: String) -> Option<String> { ... }  // pure function
 
 // User code
-import std/fs.{FileSystem, join_path}
+import effect FileSystem from std/fs
+import fn join_path from std/fs
 fn process() with FileSystem {
-    let path = join_path(dir, "config.toml")  // pure — direct call
-    FileSystem.read_file(path)                 // effect — needs handler
+    let path = join_path(a: dir, b: "config.toml")  // pure — direct call
+    FileSystem.read_file(path: path)                 // effect — needs handler
 }
 ```
 
@@ -269,15 +269,15 @@ Effects support subtyping through effect sets:
 
 ```barnacle
 // Empty effect set = pure function
-fn pure() -> I32 { 42 }
+fn pure() -> Int { return 42 }
 
 // Single effect
-fn one() -> () with Console { Console.print("one") }
+fn one() -> () with Console { Console.print(msg: "one") }
 
 // Multiple effects
 fn two() -> () with Console, FileSystem { 
-    Console.print("reading")
-    FileSystem.read_file("config")
+    Console.print(msg: "reading")
+    FileSystem.read_file(path: "config")
 }
 
 // Effect polymorphism — generic over any effect set
@@ -286,9 +286,9 @@ fn generic<E>(f: () -> () with E) -> () with E {
 }
 
 // Can call with any effect set
-generic(pure)       // E = {}
-generic(one)        // E = {Console}
-generic(two)        // E = {Console, FileSystem}
+generic(f: pure)       // E = {}
+generic(f: one)        // E = {Console}
+generic(f: two)        // E = {Console, FileSystem}
 ```
 
 ---
@@ -1116,95 +1116,445 @@ The core is minimal and orthogonal. Everything else is built on top in userland.
 
 ```barnacle
 Bool            // true, false
-I8, I16, I32, I64
-U8, U16, U32, U64
-F32, F64
-Char            // Unicode scalar value
+Int             // 64-bit signed integer (default)
+Float           // 64-bit floating point (default)
 String          // UTF-8 string
+Byte            // Single byte (8-bit unsigned)
 Never           // uninhabited type (for functions that don't return)
 ()              // unit type
 ```
 
+#### Sized Variants (for interop)
+
+When you need explicit sizes for FFI, Wasm interop, or performance:
+
+```barnacle
+// Signed integers
+Int8, Int16, Int32, Int64
+
+// Unsigned integers
+UInt8, UInt16, UInt32, UInt64
+
+// Floating point
+Float32, Float64
+```
+
+Use the readable `Int` and `Float` types by default. Only use sized variants when you need explicit control.
+
 #### Compound Types
 
 ```barnacle
-// Tuple
-(I32, String, Bool)
+// Row type (structural, named fields)
+type Point { x: Float, y: Float }
 
-// Struct (nominal)
-struct Point {
-    x: F64,
-    y: F64,
-}
+// Anonymous row type (inline structural)
+{ name: String, age: Int }
 
-// Record (structural, anonymous)
-{ name: String, age: I32 }
-
-// Enum (algebraic data type)
+// Enum (algebraic data type with atom variants)
 enum Option<T> {
-    Some(T),
-    None,
+    :some { value: T },
+    :none,
 }
 
 enum Result<T, E> {
-    Ok(T),
-    Err(E),
+    :ok { value: T },
+    :err { error: E },
 }
 
 // List
 List<T>
 
-// Map
+// Map (requires non-identifier keys or atoms)
 Map<K, V>
+
+// Set
+Set<T>
 
 // Function type
 (A, B) -> C with E
 ```
 
-### 8.2 Generics
+### 8.2 Structural Typing by Default
+
+**Barnacle uses structural typing by default** — types are shapes, and any value with matching fields fits:
+
+```barnacle
+// Named type alias for a structural shape
+type Point { x: Float, y: Float }
+
+// Anonymous row type (inline)
+fn get_name(obj: { name: String }) -> String {
+    obj.name
+}
+
+// Works with any value that has a `name: String` field
+get_name({ name: "Alice", age: 30 })
+get_name({ name: "Bob", city: "NYC", active: true })
+```
+
+Named types via `type Name { fields }` are **named aliases for shapes**, not distinct nominal types. This makes APIs flexible while maintaining readability.
+
+#### Width Subtyping
+
+Barnacle supports **width subtyping** — a type with more fields can be used where fewer are expected:
+
+```barnacle
+type Person { name: String }
+type Employee { name: String, id: Int, department: String }
+
+fn greet(person: Person) -> String {
+    "Hello, {person.name}!"
+}
+
+let emp: Employee = { name: "Alice", id: 42, department: "Engineering" }
+greet(emp)  // ✅ Employee has all fields of Person (and more)
+```
+
+The extra fields are ignored at the call site. This enables evolution of data structures without breaking existing code.
+
+### 8.3 Generics
 
 Full support for parametric polymorphism:
 
 ```barnacle
-fn identity<T>(x: T) -> T { x }
+fn identity<T>(value: T) -> T { value }
 
-fn map<T, U, E>(list: List<T>, f: (T) -> U with E) -> List<U> with E {
+fn map<T, U, E>(self list: List<T>, transform: (T) -> U with E) -> List<U> with E {
     // Generic over value types T, U and effect set E
 }
 
-struct Box<T> {
-    value: T,
-}
+type Box<T> { value: T }
 
 enum Tree<T> {
-    Leaf(T),
-    Node(Tree<T>, Tree<T>),
+    :leaf { value: T },
+    :node { left: Tree<T>, right: Tree<T> },
 }
 ```
 
-### 8.3 Effect Polymorphism
+### 8.4 Effect Polymorphism
 
 Functions can be generic over effect sets:
 
 ```barnacle
-fn retry<T, E>(f: () -> T with E, times: I32) -> T with E {
+fn retry<T, E>(f: () -> T with E, times: Int) -> T with E {
     // Generic over effect set E
     // Works with any effect, including Fail
 }
 ```
 
-### 8.4 Subtyping
+### 8.5 Tag System — Compile-Time Evidence
+
+**Tags replace distinct/nominal typing entirely.** They provide zero-runtime-cost evidence that values have passed through specific validations, state transitions, or transformations.
+
+#### Basic Tag Syntax
+
+Tags are composable type evidence using the `& :tag` syntax:
+
+```barnacle
+// Add evidence to a type
+String & :email                    // A string that's been validated as an email
+Int & :positive                    // An integer that's been validated as positive
+Connection & :connected & :authenticated   // A connection with multiple evidences
+```
+
+Tags are:
+- **Compile-time only** — zero runtime cost, erased after type checking
+- **Additive** — you can accumulate multiple tags
+- **Not fabricable** — can only come from functions that produce them
+- **Widening-safe** — tags can always be stripped (widened to untagged)
+
+#### Creating Tagged Values
+
+Use `tag()` to add evidence (accumulates with existing tags):
+
+```barnacle
+fn validate_email(input: String) -> String & :email with Fail<ValidationError> {
+    if input.contains("@") {
+        return tag(value: input, as: :email)
+    } else {
+        Fail.fail(ValidationError { message: "Invalid email" })
+    }
+}
+
+fn ensure_positive(value: Int) -> Int & :positive with Fail<ValueError> {
+    if value > 0 {
+        return tag(value: value, as: :positive)
+    } else {
+        Fail.fail(ValueError { message: "Value must be positive" })
+    }
+}
+```
+
+Use `retag()` to replace all tags (for state transitions):
+
+```barnacle
+fn disconnect(conn: Connection & :connected) -> Connection & :disconnected {
+    close_socket(conn)
+    retag(value: conn, as: :disconnected)
+}
+```
+
+#### Tag Patterns and Use Cases
+
+**1. Validation Evidence**
+
+```barnacle
+type User {
+    email: String & :email,
+    username: String & :non_empty,
+    age: Int & :positive,
+}
+
+fn create_user(email: String, username: String, age: Int) -> User with Fail<ValidationError> {
+    let valid_email = validate_email(email)
+    let valid_username = validate_non_empty(username)
+    let valid_age = ensure_positive(age)
+    
+    { email: valid_email, username: valid_username, age: valid_age }
+}
+```
+
+**2. State Machines / Typestate**
+
+```barnacle
+type Connection { socket: Socket }
+
+fn connect(host: String) -> Connection & :connected with Network { ... }
+fn authenticate(conn: Connection & :connected) -> Connection & :connected & :authenticated with Network { ... }
+fn send_message(conn: Connection & :connected & :authenticated, msg: String) -> () with Network { ... }
+
+// Type system prevents you from sending messages without authentication:
+let conn = connect(host: "example.com")
+// send_message(conn, "hello")  // ❌ Type error: missing :authenticated tag
+let authed = authenticate(conn)
+send_message(conn: authed, msg: "hello")  // ✅
+```
+
+**3. Capabilities / Permissions**
+
+```barnacle
+type Request { path: String, headers: Map<String, String> }
+
+fn require_auth(req: Request) -> Request & :authenticated with Fail<AuthError> { ... }
+fn require_admin(req: Request & :authenticated) -> Request & :authenticated & :admin with Fail<AuthError> { ... }
+
+fn delete_user(req: Request & :authenticated & :admin, user_id: Int) -> () with Database {
+    // Can only be called with authenticated + admin request
+    Database.execute(query: "DELETE FROM users WHERE id = ?", params: [user_id])
+}
+```
+
+**4. Resource Lifecycle**
+
+```barnacle
+type File { handle: FileHandle }
+
+fn open_file(path: String) -> File & :open with FileSystem { ... }
+fn make_writable(file: File & :open) -> File & :open & :writable with FileSystem { ... }
+fn write(file: File & :open & :writable, data: String) -> () with FileSystem { ... }
+fn close(file: File & :open) -> File & :closed with FileSystem { ... }
+```
+
+**5. Data Provenance / Pipeline Stages**
+
+```barnacle
+type Dataset<T> { rows: List<T> }
+
+fn clean(data: Dataset<T>) -> Dataset<T> & :cleaned { ... }
+fn dedupe(data: Dataset<T> & :cleaned) -> Dataset<T> & :cleaned & :deduped { ... }
+fn normalize(data: Dataset<T> & :cleaned & :deduped) -> Dataset<T> & :cleaned & :deduped & :normalized { ... }
+
+fn analyze(data: Dataset<User> & :cleaned & :deduped & :normalized) -> Report {
+    // Type system ensures data has gone through all required stages
+}
+```
+
+**6. Builder Replacement**
+
+Instead of traditional builder patterns, use tags to track required fields:
+
+```barnacle
+type HttpRequest { url: Option<String>, method: Option<String>, headers: Map<String, String> }
+
+fn new_request() -> HttpRequest {
+    { url: :none, method: :none, headers: {} }
+}
+
+fn with_url(req: HttpRequest, url: String) -> HttpRequest & :has_url {
+    tag(value: { ...req, url: :some { value: url } }, as: :has_url)
+}
+
+fn with_method(req: HttpRequest, method: String) -> HttpRequest & :has_method {
+    tag(value: { ...req, method: :some { value: method } }, as: :has_method)
+}
+
+fn send(req: HttpRequest & :has_url & :has_method) -> Response with Network {
+    // Type system ensures URL and method are set before sending
+}
+```
+
+**7. Protocol State**
+
+```barnacle
+// SMTP protocol states
+fn smtp_connect() -> SmtpSession & :connected { ... }
+fn smtp_helo(session: SmtpSession & :connected) -> SmtpSession & :greeted { ... }
+fn smtp_mail_from(session: SmtpSession & :greeted) -> SmtpSession & :has_sender { ... }
+fn smtp_rcpt_to(session: SmtpSession & :has_sender) -> SmtpSession & :has_recipient { ... }
+fn smtp_data(session: SmtpSession & :has_recipient) -> SmtpSession & :sending_data { ... }
+```
+
+**8. Taint Tracking**
+
+```barnacle
+// User input is tainted by default
+fn get_user_input() -> String & :tainted with Console { ... }
+
+fn sanitize_html(input: String & :tainted) -> String & :sanitized {
+    // Remove dangerous HTML
+    let clean = strip_tags(input)
+    tag(value: clean, as: :sanitized)
+}
+
+fn render_html(content: String & :sanitized) -> String {
+    // Only accepts sanitized content
+    "<div>{content}</div>"
+}
+```
+
+#### Tags vs Effects: Complementary Tools
+
+- **Tags** provide compile-time evidence (this value has been validated)
+- **Effects** (like `Fail<E>`) provide runtime branching (this operation can fail)
+- **Together**: If code is reachable after a validation function with `Fail`, the tag is guaranteed
+
+```barnacle
+fn process_email(input: String) -> () with Fail<ValidationError> {
+    let email = validate_email(input)  // Returns String & :email, but can Fail
+    // If we reach this line, email definitely has :email tag
+    send_email(to: email)
+}
+```
+
+#### Tag Stripping (Widening)
+
+Tags can always be stripped through widening:
+
+```barnacle
+let tagged: Int & :positive = ensure_positive(value: 42)
+let plain: Int = tagged  // ✅ Widening is always safe
+```
+
+This allows tagged values to be used in contexts that don't care about the evidence.
+
+### 8.6 Atoms and Enums Unified
+
+Atoms are lightweight values prefixed with `:`, similar to symbols in Lisp or atoms in Erlang. They unify with the enum system to provide both ad-hoc and named unions.
+
+#### Atoms as Values
+
+```barnacle
+:ok                    // Simple atom
+:error                 // Another atom
+:get                   // HTTP method as atom
+:post                  // Another HTTP method
+
+// Atoms with associated data
+:some { value: 42 }
+:err { error: "file not found" }
+:point { x: 1.0, y: 2.0 }
+```
+
+#### Inline Atom Unions
+
+Use `|` to create anonymous unions of atoms:
+
+```barnacle
+// Function that returns one of several atoms
+fn status() -> :ok | :pending | :error {
+    :ok
+}
+
+// Pattern match on atom unions
+match status() {
+    :ok -> "Success"
+    :pending -> "In progress"
+    :error -> "Failed"
+}
+```
+
+#### Named Enums (Closed Sets)
+
+Use `enum` to define a closed, named set of atom variants:
+
+```barnacle
+enum Option<T> {
+    :some { value: T },
+    :none,
+}
+
+enum Result<T, E> {
+    :ok { value: T },
+    :err { error: E },
+}
+
+enum HttpMethod {
+    :get,
+    :post,
+    :put,
+    :delete,
+    :patch,
+}
+```
+
+#### Structural Compatibility
+
+Atoms in named enums are structurally compatible with atom unions:
+
+```barnacle
+enum Color {
+    :red,
+    :green,
+    :blue,
+}
+
+fn is_primary(color: :red | :blue) -> Bool {
+    true
+}
+
+let c: Color = :red
+is_primary(c)  // ✅ :red in Color is compatible with :red in union
+```
+
+#### Syntax Semantics
+
+- `|` means "one of these" (union)
+- `&` means "all of these" (intersection/evidence)
+
+```barnacle
+// Union: value is ONE of these atoms
+:get | :post | :delete
+
+// Intersection: value has ALL these tags
+String & :validated & :sanitized
+```
+
+### 8.7 Subtyping
 
 Barnacle has limited subtyping:
 
-1. **Effect subtyping**: `A with E1` is a subtype of `A with E2` if `E1 ⊆ E2`
-2. **Row polymorphism**: `{ x: I32, y: I32, z: I32 }` is a subtype of `{ x: I32, y: I32 }`
+1. **Width subtyping**: `{ x: Int, y: Int, z: Int }` is a subtype of `{ x: Int, y: Int }`
+2. **Effect subtyping**: `A with E1` is a subtype of `A with E2` if `E1 ⊆ E2`
+3. **Tag widening**: `T & :tag` is a subtype of `T` (tags can be stripped)
+4. **Atom union subtyping**: Single atoms are subtypes of unions containing them
 
-No class-based inheritance. Use composition and traits instead.
+No class-based inheritance. Use composition and structural typing instead.
 
-### 8.5 Traits
+### 8.8 Traits (Future Work)
 
-Traits define shared behavior:
+> **Note**: Trait system design is still in progress. The syntax shown here is provisional.
+
+Traits will define shared behavior and generic constraints:
 
 ```barnacle
 trait Show {
@@ -1215,41 +1565,61 @@ trait Eq {
     fn eq(self, other: Self) -> Bool
 }
 
-impl Show for Point {
-    fn show(self) -> String {
-        "Point { x: ${self.x}, y: ${self.y} }"
-    }
-}
-
-impl<T> Show for List<T> where T: Show {
-    fn show(self) -> String {
-        "[" ++ self.map(fn(x) { x.show() }).join(", ") ++ "]"
-    }
-}
+// Implementation syntax TBD
+// Constraint syntax TBD
 ```
 
 Traits are separate from effects. Traits are about polymorphism (compile-time dispatch), effects are about side-effect tracking.
 
-### 8.6 Null Safety
+### 8.9 Null Safety
 
 No null. Use `Option<T>`:
 
 ```barnacle
 enum Option<T> {
-    Some(T),
-    None,
+    :some { value: T },
+    :none,
 }
 
-fn divide(a: I32, b: I32) -> Option<I32> {
+fn divide(a: Int, b: Int) -> Option<Int> {
     if b == 0 {
-        None
+        :none
     } else {
-        Some(a / b)
+        :some { value: a / b }
     }
 }
 ```
 
-### 8.7 Row Types and Structural Records
+### 8.10 No Methods on Types
+
+Barnacle has **no methods attached to types**. Instead:
+
+- Functions with a `self` parameter
+- The pipeline operator `|>` for chaining
+
+```barnacle
+// Define functions with self parameter (positional for pipeline)
+fn filter<T>(self data: List<T>, predicate: (T) -> Bool) -> List<T> { ... }
+fn map<T, U>(self data: List<T>, transform: (T) -> U) -> List<U> { ... }
+
+// Use pipeline operator for "method call" syntax
+users 
+    |> filter(predicate: u => u.active) 
+    |> map(transform: u => u.name)
+    |> sort()
+
+// Equivalent to:
+sort(map(transform: u => u.name, self: filter(predicate: u => u.active, self: users)))
+```
+
+The `self` parameter is special:
+- It's the **only positional parameter** (all others are named)
+- Pipeline `|>` feeds into the `self` parameter
+- This creates the ergonomics of method chaining without tying functions to types
+
+Types are pure data. Modules organize related functions.
+
+### 8.11 Row Types and Structural Records
 
 Records are structural (duck-typed):
 
@@ -1264,6 +1634,25 @@ get_name({ name: "Bob", city: "NYC" })
 ```
 
 This enables row polymorphism for flexible APIs.
+
+### 8.12 No Tuples
+
+Barnacle does not have tuples. Use row types with named fields instead:
+
+```barnacle
+// ❌ No tuples
+// fn divide(a: Int, b: Int) -> (Int, Int)
+
+// ✅ Use row types
+fn divide(a: Int, b: Int) -> { quotient: Int, remainder: Int } {
+    { quotient: a / b, remainder: a % b }
+}
+
+let result = divide(a: 17, b: 5)
+let { quotient, remainder } = result
+```
+
+Named fields are self-documenting and eliminate the need to remember positional order.
 
 ---
 
@@ -1348,22 +1737,23 @@ The compiler backend is pluggable to support both targets.
 
 ### 10.1 Module Structure
 
-A module is a single `.barnacle` file:
+A module is a single `.barnacle` file. The file path determines the module path.
 
 ```barnacle
 // user.barnacle
-import std/string.{capitalize}
-import app/db.{Database}
+import type User from app/models
+import effect Database from app/db
+import fn capitalize from std/string
 
-pub struct User {
-    pub name: String,
-    pub email: String,
+export type User {
+    name: String,
+    email: String,
 }
 
-pub fn create_user(name: String, email: String) -> User with Database {
-    let user = User { name: capitalize(name), email }
-    Database.insert("users", user)
-    user
+export fn create_user(name: String, email: String) -> User with Database {
+    let user = { name: capitalize(name), email }
+    Database.insert(table: "users", data: user)
+    return user
 }
 
 fn validate_email(email: String) -> Bool {
@@ -1372,32 +1762,7 @@ fn validate_email(email: String) -> Bool {
 }
 ```
 
-### 10.2 Import Syntax
-
-```barnacle
-// Import everything
-import std/string
-
-// Import specific items
-import std/string.{capitalize, lowercase}
-
-// Import with alias
-import std/collections.{Map as HashMap}
-
-// Import module with alias
-import std/collections as coll
-```
-
-### 10.3 Export Rules
-
-- `pub` items are exported
-- Non-`pub` items are private to the module
-- Effects are always exported (they're interfaces, not implementations)
-
-### 10.4 Package Management
-
-Packages follow the Wasm component model. A package is a collection of modules compiled to a Wasm component.
-
+File structure:
 ```
 app/
   barnacle.toml       # package manifest
@@ -1405,7 +1770,122 @@ app/
     main.barnacle
     user.barnacle
     db.barnacle
+    models.barnacle
 ```
+
+### 10.2 Import Syntax
+
+Barnacle uses **explicit import categories** to make it clear what kind of entity is being imported:
+
+```barnacle
+// Import types
+import type User, Post from app/models
+import type Point from geometry/shapes
+
+// Import effects
+import effect Console from std/io
+import effect Database from app/db
+
+// Import functions
+import fn map, filter from std/list
+import fn capitalize from std/string
+
+// Import handlers
+import handler postgres from app/db/handlers
+
+// Import annotations (metadata)
+import annotation deprecated, test from std/meta
+
+// Import module (qualified access)
+import module std/string
+// Use as: string.capitalize(...)
+
+// Rename with `as`
+import effect Database from app/db as primary
+import effect Database from app/replica as replica
+import type Map from std/collections as HashMap
+
+// Multiple from same module
+import type User, Post, Comment from app/models
+import effect Http, WebSocket from std/net
+```
+
+#### Named Effect Instances
+
+The `as` keyword enables multiple instances of the same effect:
+
+```barnacle
+import effect Database from app/db as primary
+import effect Database from app/replica as secondary
+
+fn replicate_data() -> () with primary.Database, secondary.Database {
+    let data = primary.Database.query(sql: "SELECT * FROM users")
+    secondary.Database.insert_batch(data: data)
+}
+```
+
+### 10.3 Export Syntax
+
+Use `export` (not `pub`) for public visibility:
+
+```barnacle
+// Export type
+export type User { name: String, email: String }
+
+// Export function
+export fn create_user(name: String, email: String) -> User { ... }
+
+// Export effect
+export effect Database {
+    query(sql: String) -> List<Row>
+    execute(sql: String) -> ()
+}
+
+// Re-export from another module
+export type User from app/models
+export fn validate from app/validation
+export effect Database from app/db
+```
+
+Private by default — anything without `export` is module-private.
+
+### 10.4 Handlers and World
+
+Handlers are typically wired in `world` declarations, not imported into application code:
+
+```barnacle
+// app/main.barnacle
+import effect Database from app/db
+import effect Console from std/io
+
+export fn main() -> () with Database, Console {
+    Console.print(msg: "Starting app...")
+    let users = Database.query(sql: "SELECT * FROM users")
+    Console.print(msg: "Found {users.length} users")
+}
+
+// world configuration (separate file or section)
+world app {
+    entry main
+    handle Database with postgres(conn: "postgres://localhost/mydb")
+    handle Console with stdio
+}
+```
+
+Local `handle` blocks can still use handlers directly:
+
+```barnacle
+import handler mock_db from app/test_helpers
+
+fn test_create_user() {
+    let result = handle create_user(name: "Alice", email: "alice@example.com") with mock_db
+    assert(result.name == "Alice")
+}
+```
+
+### 10.5 Package Management
+
+Packages follow the Wasm component model. A package is a collection of modules compiled to a Wasm component.
 
 `barnacle.toml`:
 ```toml
@@ -1414,54 +1894,453 @@ name = "app"
 version = "0.1.0"
 
 [dependencies]
-"barnacle:std" = "1.0"
-"myorg:db" = "0.5"
+"std" = "1.0"
+"fermyon/http" = "0.5"
 ```
 
+Package namespaces:
+- `std/io` — standard library
+- `app/models` — local package modules
+- `fermyon/http` — third-party packages
+
 Dependencies are Wasm components. No source code dependencies — everything is distributed as compiled components with WIT interfaces.
+
+### 10.6 No Circular Imports
+
+Circular imports are not allowed. The module graph must be a DAG (directed acyclic graph).
+
+If you need shared types between modules, extract them to a common module that both depend on.
 
 ---
 
 ## 11. Syntax Overview
 
-### 11.1 Basic Syntax
+### 11.1 Keywords and Visibility
 
 ```barnacle
-// Comments
+fn          // function declarations
+let         // immutable bindings
+let mut     // mutable bindings
+const       // compile-time constants
+export      // public visibility (NOT pub)
+effect      // effect declarations
+handler     // effect handlers
+handle      // handle expression with handler
+with        // effect annotation, handler binding
+resume      // resume continuation in handler
+match       // pattern matching
+return      // explicit return (required in multi-statement functions)
+if          // conditional expression
+else        // else branch
+for         // loops
+while       // while loops
+break       // break from loop
+continue    // continue loop
+comptime    // compile-time execution
+world       // top-level configuration
+annotation  // metadata declarations
+use         // disposable/resource cleanup
+import      // import declarations
+type        // type alias declarations
+enum        // enum declarations
+```
+
+### 11.2 Comments
+
+```barnacle
 // Single line comment
 
 /* 
    Multi-line comment
+   /* Nestable */
 */
 
-// Variables
+/// Documentation comment
+/// These appear in generated docs and LSP hovers
+```
+
+### 11.3 Variables and Constants
+
+```barnacle
+// Immutable binding (default)
 let x = 42
-let y: I32 = 42
-let mut z = 0
+let y: Int = 42
 
-// Functions
-fn add(a: I32, b: I32) -> I32 {
-    a + b
+// Mutable binding
+let mut counter = 0
+counter = counter + 1
+
+// Compile-time constant
+const MAX_USERS: Int = 1000
+const PI: Float = 3.14159
+```
+
+### 11.4 Functions
+
+**All function parameters are named** (except `self` which is positional for pipeline):
+
+```barnacle
+// Function declaration
+fn add(a: Int, b: Int) -> Int {
+    return a + b
 }
 
-// Blocks are expressions
-let x = {
-    let a = 1
-    let b = 2
-    a + b  // last expression is the result
+// Function with default values
+fn connect(host: String, port: Int = 5432) -> Connection {
+    // port is optional, defaults to 5432
 }
 
-// If is an expression
-let max = if a > b { a } else { b }
+// Call with named arguments
+connect(host: "localhost", port: 5432)
+connect(host: "localhost")  // uses default port
 
-// Pattern matching
-match option {
-    Some(x) -> x * 2
-    None -> 0
+// Function with self parameter (for pipeline)
+fn filter<T>(self data: List<T>, predicate: (T) -> Bool) -> List<T> {
+    // self is positional and feeds from pipeline
+}
+
+// Pipeline usage
+users |> filter(predicate: u => u.active)
+// Equivalent to: filter(self: users, predicate: u => u.active)
+
+// Explicit return required
+fn max(a: Int, b: Int) -> Int {
+    if a > b {
+        return a
+    } else {
+        return b
+    }
 }
 ```
 
-### 11.2 Operators
+### 11.5 Lambdas (Arrow Syntax)
+
+```barnacle
+// Single parameter
+x => x * 2
+
+// Multiple parameters
+(a, b) => a + b
+
+// No parameters
+() => 42
+
+// Single-expression lambdas are implicitly their value
+let double = x => x * 2
+
+// Multi-statement lambdas require explicit return
+let complex = (a, b) => {
+    let sum = a + b
+    let product = a * b
+    return { sum, product }
+}
+
+// Use in higher-order functions
+users |> map(transform: u => u.name)
+users |> filter(predicate: u => u.age > 18)
+```
+
+Note: Lambdas use `=>` (arrow), NOT `|x|` syntax.
+
+### 11.6 String Literals
+
+```barnacle
+// Simple string
+let name = "Alice"
+
+// Interpolation with {}
+let greeting = "Hello, {name}!"
+let calculation = "2 + 2 = {2 + 2}"
+
+// Escape literal braces
+let literal = "\{not interpolated\}"
+
+// Multi-line strings (triple quotes)
+let poem = """
+    Roses are red,
+    Violets are blue,
+    Barnacle is awesome,
+    And so are you.
+"""
+
+// Raw strings (no escaping, no interpolation)
+let regex = r"^\d{3}-\d{2}-\d{4}$"
+let path = r"C:\Users\Alice\Documents"
+```
+
+### 11.7 Numeric Types
+
+```barnacle
+// Default integers and floats (readable names)
+let count: Int = 42              // 64-bit signed integer
+let price: Float = 19.99         // 64-bit float
+
+// Sized variants for interop/performance
+let byte: Int8 = 127
+let short: Int16 = 32000
+let int: Int32 = 2_147_483_647
+let long: Int64 = 9_223_372_036_854_775_807
+
+let unsigned: UInt32 = 4_294_967_295
+let small: UInt8 = 255
+
+let single: Float32 = 3.14
+let double: Float64 = 2.718281828
+
+// Bool and Byte
+let flag: Bool = true
+let byte_val: Byte = 0xFF
+```
+
+### 11.8 Collection Literals
+
+```barnacle
+// List
+let numbers = [1, 2, 3, 4, 5]
+let names = ["Alice", "Bob", "Charlie"]
+
+// Row type value (identifier keys)
+let person = { name: "Alice", age: 30 }
+let point = { x: 1.0, y: 2.0 }
+
+// Map (string literal keys)
+let config = { "host": "localhost", "port": 5432 }
+
+// Map (atom keys)
+let options = { :timeout: 30000, :retry: true }
+
+// Map (computed keys)
+let dynamic = { [compute_key()]: "value" }
+
+// Set (function call, not literal)
+let unique = Set("alice", "bob", "charlie")
+
+// Parser distinguishes row vs map by key type:
+// - Identifier keys -> row type
+// - Expression keys (string literals, atoms, computed) -> map
+```
+
+### 11.9 Spread Operator
+
+```barnacle
+// Flat spread (rows and maps)
+let user = { name: "Alice", age: 30 }
+let updated = { ...user, age: 31 }
+
+// List spread
+let a = [1, 2, 3]
+let b = [4, 5, 6]
+let combined = [...a, ...b]  // [1, 2, 3, 4, 5, 6]
+
+// Deep spread (dotted paths)
+let person = {
+    name: "Alice",
+    address: { city: "NYC", state: "NY" }
+}
+let relocated = { ...person, address.city: "Portland", address.state: "OR" }
+
+// Deep spread desugars to nested spreads at compile time
+```
+
+### 11.10 Destructuring
+
+```barnacle
+// Flat destructuring
+let { name, age } = user
+let { x, y } = point
+
+// Deep destructuring (dotted paths)
+let { address.city, address.state } = person
+
+// Rename with `as` (NOT `:`)
+let { name as user_name } = user
+let { address.city as hometown } = person
+
+// Rest operator (flat only, no mixing with deep destructuring)
+let { name, email, ...rest } = user
+
+// In let bindings
+let { quotient, remainder } = divide(a: 17, b: 5)
+
+// In for loops
+for { name, age } in users {
+    Console.print(msg: "{name} is {age} years old")
+}
+
+// In match expressions
+match result {
+    :ok { value } -> value
+    :err { error } -> handle_error(error)
+}
+
+// NOT in lambda parameters (use explicit let inside)
+let process = user => {
+    let { name, age } = user
+    return "{name} ({age})"
+}
+```
+
+**Note**: Maps use `.get()` method, not destructuring.
+
+### 11.11 Pipeline Operator
+
+The pipeline operator `|>` feeds into the `self` parameter:
+
+```barnacle
+// Instead of nested calls
+let result = process(transform(filter(data, predicate: pred), mapper: map_fn))
+
+// Use pipeline
+let result = data
+    |> filter(predicate: pred)
+    |> transform(mapper: map_fn)
+    |> process
+
+// Real-world example
+let active_user_names = users
+    |> filter(predicate: u => u.active)
+    |> map(transform: u => u.name)
+    |> sort()
+```
+
+The `self` parameter is the **only positional parameter** in Barnacle. All other parameters are named.
+
+### 11.12 Pattern Matching
+
+```barnacle
+// Match with arrow syntax (->)
+match value {
+    0 -> "zero"
+    1 | 2 -> "one or two"
+    n if n > 10 -> "big"
+    _ -> "other"
+}
+
+// Destructuring atoms
+match result {
+    :ok { value } -> value
+    :err { error } -> "Error: {error}"
+}
+
+match status {
+    :pending -> "Waiting..."
+    :complete { result } -> "Done: {result}"
+    :failed { reason } -> "Failed: {reason}"
+}
+
+// Destructuring rows
+match point {
+    { x: 0, y: 0 } -> "origin"
+    { x, y } -> "at {x}, {y}"
+}
+
+// List patterns
+match list {
+    [] -> "empty"
+    [x] -> "singleton: {x}"
+    [first, second, ...rest] -> "at least two"
+}
+```
+
+### 11.13 Control Flow
+
+```barnacle
+// If is an expression
+let max = if a > b { a } else { b }
+
+// If with multiple branches
+let category = if score >= 90 {
+    "A"
+} else if score >= 80 {
+    "B"
+} else if score >= 70 {
+    "C"
+} else {
+    "F"
+}
+
+// While loop
+let mut i = 0
+while i < 10 {
+    Console.print(msg: "i = {i}")
+    i = i + 1
+}
+
+// For loop
+for user in users {
+    Console.print(msg: user.name)
+}
+
+// For loop with index
+for { item, index } in users.enumerate() {
+    Console.print(msg: "{index}: {item.name}")
+}
+
+// Break and continue
+for x in numbers {
+    if x < 0 {
+        continue
+    }
+    if x > 100 {
+        break
+    }
+    process(x)
+}
+```
+
+### 11.14 Effects and Handlers
+
+```barnacle
+// Effect declaration
+effect Console {
+    print(msg: String) -> ()
+    read_line() -> String
+}
+
+// Function with effects
+fn greet(name: String) -> () with Console {
+    Console.print(msg: "Hello, {name}!")
+}
+
+// Handler
+handler real_console: Console {
+    print(msg) -> resume(wasi_print(msg))
+    read_line() -> resume(wasi_read_line())
+}
+
+// Handle expression
+handle greet(name: "Alice") with real_console
+```
+
+### 11.15 Disposable Pattern (use)
+
+The `use` keyword provides sugar over effect handlers for resource cleanup:
+
+```barnacle
+// use binding runs cleanup when block exits
+use file = open_file(path: "config.toml")
+let contents = read_file(file)
+// file automatically closed here
+
+// Multiple use bindings dispose in reverse order
+use conn = connect(host: "localhost")
+use tx = begin_transaction(conn)
+let result = execute_query(tx)
+commit(tx)
+// tx disposed, then conn disposed
+
+// Cleanup runs even on Fail
+fn process_file(path: String) -> String with FileSystem, Fail<IoError> {
+    use file = open_file(path)  // Acquires resource
+    if !is_valid(file) {
+        Fail.fail(IoError { message: "Invalid file" })
+        // file still cleaned up!
+    }
+    return read_file(file)
+}
+```
+
+### 11.16 Operators
 
 ```barnacle
 // Arithmetic
@@ -1476,60 +2355,34 @@ match option {
 // Bitwise
 & | ^ << >> ~
 
-// String concatenation
+// String concatenation (for now, may change to + in future)
 ++
 
 // Pipeline
 |>
 
-// Function composition
->>
+// Tag composition (type-level)
+&   // in types: T & :tag
+
+// Union (type-level)
+|   // in types: :a | :b
 ```
 
-### 11.3 Pipeline Operator
+### 11.17 No Semicolons
+
+Semicolons are **not required** and are **not used** in Barnacle. They can optionally be used as a statement separator if you want multiple statements on one line, but this is discouraged.
 
 ```barnacle
-// Instead of nested calls
-let result = process(transform(filter(data, pred), mapper))
+// ✅ Idiomatic
+let x = 1
+let y = 2
+let z = x + y
 
-// Use pipeline
-let result = data
-    |> filter(pred)
-    |> transform(mapper)
-    |> process
+// ❌ Avoid (but technically allowed)
+let x = 1; let y = 2; let z = x + y
 ```
 
-### 11.4 Pattern Matching
-
-```barnacle
-match value {
-    0 -> "zero"
-    1 | 2 -> "one or two"
-    n if n > 10 -> "big"
-    _ -> "other"
-}
-
-// Destructuring
-match point {
-    Point { x: 0, y: 0 } -> "origin"
-    Point { x, y } -> "at ${x}, ${y}"
-}
-
-// List patterns
-match list {
-    [] -> "empty"
-    [x] -> "singleton"
-    [x, y, ..rest] -> "at least two"
-}
-```
-
-### 11.5 String Interpolation
-
-```barnacle
-let name = "Alice"
-let age = 30
-Console.print("${name} is ${age} years old")
-```
+Use line breaks and proper indentation instead.
 
 ---
 
