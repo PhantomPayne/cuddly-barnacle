@@ -644,7 +644,7 @@ Handlers that resume multiple times or store continuations — async, generators
 handler async_executor: Async {
     suspend() -> {
         let cont = capture_continuation()
-        scheduler.enqueue(item: cont)
+        scheduler.enqueue(continuation: cont)
         return resume()
     }
 }
@@ -1759,6 +1759,7 @@ Barnacle does not have tuples. Use row types with named fields instead:
 
 // ✅ Use row types
 export fn divide(a: Int, b: Int) -> { quotient: Int, remainder: Int } {
+    // Note: A production version would check for b == 0 and use Fail<E>
     return { quotient: a / b, remainder: a % b }
 }
 
